@@ -5,16 +5,17 @@
 
 :mk_inner
 @echo off
-if exist "c:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" goto :mk_enterprise_amd64
-if exist "c:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat" goto :mk_community_amd64
+if exist "c:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" goto :mk_vs_enterprise
+if exist "c:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat" goto :mk_vs_community
+echo Visual Studio 2026 not found.
 goto :mk_fail
 
-:mk_enterprise_amd64
+:mk_vs_enterprise
 call "c:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" amd64
 @echo off
 goto :mk_next
 
-:mk_community_amd64
+:mk_vs_community
 call "c:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat" amd64
 @echo off
 goto :mk_next
@@ -24,13 +25,14 @@ set INCLUDE=%INCLUDE%;c:\path\to\phnt
 cl ^
 /nologo ^
 /std:c++latest ^
+/Os ^
 /O2 ^
 /Ob2 ^
-/Os ^
 /GL ^
 /MT ^
 /GS- ^
 /Gs1048576 ^
+/Brepro ^
 peb.cpp ^
 /link ^
 /NODEFAULTLIB ^
