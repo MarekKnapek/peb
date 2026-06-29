@@ -1,6 +1,12 @@
 #include <phnt_windows.h>
 #include <phnt.h>
 
+#if defined _MSC_VER && defined _M_X64 && defined _M_AMD64
+#define bitness 64
+#elif defined _MSC_VER && defined _M_IX86 && !defined _M_I86 && !defined M_I86
+#define bitness 32
+#endif
+
 #if defined DEBUG || defined _DEBUG
 void mk_crash(void){ int volatile* volatile ptr; ptr = NULL; *ptr = 0; }
 #define mk_assert(x) (((x)) ? ((void)(0)) : ((void)(mk_crash())))
@@ -54,6 +60,27 @@ constexpr static inline DWORD fnv1a(LPCCH const& str, DWORD const& len)
 
 	fnv1a_init(hasher);
 	fnv1a_append(hasher, str, len);
+	return fnv1a_finish(hasher);
+}
+
+constexpr static inline DWORD fnv1alcdll(LPCSTR const& str, DWORD const& len)
+{
+	fnv1a_state hasher;
+	DWORD n;
+	DWORD i;
+	UCHAR uchar;
+
+	fnv1a_init(hasher);
+	n = len;
+	for(i = 0; i != n; ++i)
+	{
+		uchar = (str[i] >= 'A' && str[i] <= 'Z') ? ((UCHAR)(str[i] + ('a' - 'A'))) : ((UCHAR)(str[i]));
+		fnv1a_append(hasher, uchar);
+	}
+	fnv1a_append(hasher, '.');
+	fnv1a_append(hasher, 'd');
+	fnv1a_append(hasher, 'l');
+	fnv1a_append(hasher, 'l');
 	return fnv1a_finish(hasher);
 }
 
@@ -136,30 +163,42 @@ static inline HMODULE find_module(PPEB const& peb, DWORD const& k_hash)
 
 static inline LPVOID va_to_real(HMODULE const& mod, PIMAGE_SECTION_HEADER const& sections, WORD const& count, DWORD const& va, DWORD const& sz)
 {
-	LPVOID real;
-	LPBYTE base;
-	WORD n;
-	WORD i;
-	DWORD sec_va;
-	DWORD raw;
-
-	real = NULL;
-	base = ((LPBYTE)(mod));
-	n = count;
-	for(i = 0; i != n; ++i)
-	{
-		sec_va = sections[i].VirtualAddress;
-		if(va >= sec_va && va + sz <= sec_va + sections->SizeOfRawData)
-		{
-			raw = sections[i].PointerToRawData + (va - sec_va);
-			real = base + raw;
-			break;
-		}
-	}
-	return real;
+	return ((LPVOID)(((LPBYTE)(mod)) + va));
 }
 
-static inline FARPROC find_proc(HMODULE const& mod, DWORD const& k_hash)
+[[nodiscard]] static inline int mk_str_len(LPCSTR const str)
+{
+	LPCSTR s;
+	int len;
+
+	mk_assert(str);
+
+	s = str;
+	while(*s != '\0')
+	{
+		++s;
+	}
+	len = ((int)(s - str));
+	return len;
+}
+
+[[nodiscard]] static inline int find_dot(LPCSTR const str)
+{
+	LPCSTR s;
+	int len;
+
+	mk_assert(str);
+
+	s = str;
+	while(*s != '.')
+	{
+		++s;
+	}
+	len = ((int)(s - str));
+	return len;
+}
+
+static inline FARPROC find_proc(PPEB const peb, HMODULE const& mod, DWORD const& k_hash)
 {
 	FARPROC proc;
 	PIMAGE_DOS_HEADER dos;
@@ -181,6 +220,12 @@ static inline FARPROC find_proc(HMODULE const& mod, DWORD const& k_hash)
 	WORD ordinal;
 	LPDWORD arr_functions;
 	DWORD func_va;
+	bool is_fwd;
+	LPCSTR fwd_str;
+	int dot_pos;
+	HMODULE fwd_mod;
+
+	mk_assert(peb);
 
 	proc = NULL;
 	dos = ((PIMAGE_DOS_HEADER)(mod));
@@ -192,13 +237,13 @@ static inline FARPROC find_proc(HMODULE const& mod, DWORD const& k_hash)
 	exp_dir_sz = arr_dirs[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
 	arr_sections = ((PIMAGE_SECTION_HEADER)(((LPBYTE)(arr_dirs)) + n_dirs * sizeof(IMAGE_DATA_DIRECTORY)));
 	n_sections = nt->FileHeader.NumberOfSections;
-	exp_dir_real = ((PIMAGE_EXPORT_DIRECTORY)(va_to_real(mod, arr_sections, n_sections, exp_dir_va, exp_dir_sz)));
+	exp_dir_real = ((PIMAGE_EXPORT_DIRECTORY)(va_to_real(mod, arr_sections, n_sections, exp_dir_va, exp_dir_sz))); mk_assert(exp_dir_real);
 	n_names = exp_dir_real->NumberOfNames;
-	arr_names = ((LPDWORD)(va_to_real(mod, arr_sections, n_sections, exp_dir_real->AddressOfNames, n_names * sizeof(DWORD))));
+	arr_names = ((LPDWORD)(va_to_real(mod, arr_sections, n_sections, exp_dir_real->AddressOfNames, n_names * sizeof(DWORD)))); mk_assert(arr_names);
 	for(i_names = 0; i_names != n_names; ++i_names)
 	{
 		name_va = arr_names[i_names];
-		name_real = ((LPCCH)(va_to_real(mod, arr_sections, n_sections, name_va, 1)));
+		name_real = ((LPCCH)(va_to_real(mod, arr_sections, n_sections, name_va, 1))); mk_assert(name_real);
 		sum = fnv1a(name_real);
 		if(sum == k_hash)
 		{
@@ -206,7 +251,18 @@ static inline FARPROC find_proc(HMODULE const& mod, DWORD const& k_hash)
 			ordinal = arr_ordinals[i_names];
 			arr_functions = ((LPDWORD)(va_to_real(mod, arr_sections, n_sections, exp_dir_real->AddressOfFunctions, exp_dir_real->NumberOfFunctions * sizeof(arr_functions[0]))));
 			func_va = arr_functions[ordinal];
-			proc = ((FARPROC)(va_to_real(mod, arr_sections, n_sections, func_va, sizeof(DWORD))));
+			is_fwd = func_va >= exp_dir_va && func_va < exp_dir_va + exp_dir_sz;
+			if(!is_fwd)
+			{
+				proc = ((FARPROC)(va_to_real(mod, arr_sections, n_sections, func_va, sizeof(DWORD))));
+			}
+			else
+			{
+				fwd_str = ((LPCSTR)(va_to_real(mod, arr_sections, n_sections, func_va, sizeof(DWORD))));
+				dot_pos = find_dot(fwd_str); mk_assert(dot_pos >= 1); mk_assert(dot_pos < mk_str_len(fwd_str) - 1);
+				fwd_mod = find_module(peb, fnv1alcdll(fwd_str, dot_pos)); mk_assert(fwd_mod);
+				proc = find_proc(peb, fwd_mod, fnv1a(fwd_str + dot_pos + 1));
+			}
 			break;
 		}
 	}
@@ -258,7 +314,7 @@ typedef MMRESULT(__stdcall*tfn_waveOutClose)(HANDLE wo);
 typedef MMRESULT(__stdcall*tfn_waveOutPrepareHeader)(HANDLE wo, LPWAVEHDR hdr, UINT len);
 typedef MMRESULT(__stdcall*tfn_waveOutUnprepareHeader)(HANDLE wo, LPWAVEHDR hdr, UINT len);
 typedef MMRESULT(__stdcall*tfn_waveOutWrite)(HANDLE wo, LPWAVEHDR hdr, UINT len);
-typedef double(__stdcall*tfn_sin)(double x);
+typedef double(__cdecl*tfn_sin)(double x);
 typedef HANDLE(__stdcall*tfn_CreateEventA)(LPSECURITY_ATTRIBUTES lpEventAttributes, BOOL bManualReset, BOOL bInitialState, LPCSTR lpName);
 typedef BOOL(__stdcall*tfn_ResetEvent)(HANDLE evt);
 typedef DWORD(__stdcall*tfn_WaitForSingleObject)(HANDLE hHandle, DWORD dwMilliseconds);
@@ -304,11 +360,15 @@ static inline void make_sine(WAVEHDR& hdr)
 	FLOAT fyb;
 	SHORT shrt;
 
+	#if bitness == 32
+	teb = ((PTEB)(__readfsdword(0x18))); mk_assert(teb);
+	#elif bitness == 64
 	teb = ((PTEB)(__readgsqword(0x30))); mk_assert(teb);
+	#endif
 	mk_assert(teb->NtTib.Self == &teb->NtTib);
 	peb = teb->ProcessEnvironmentBlock; mk_assert(peb);
 	ntdll = find_module(peb, k_hash_ntdll);
-	pfn_sin = ((tfn_sin)(find_proc(ntdll, k_hash_sin)));
+	pfn_sin = ((tfn_sin)(find_proc(peb, ntdll, k_hash_sin)));
 	sampling_rate = ((FLOAT)(k_sampling_rate));
 	ftwo = ((FLOAT)(2.0f));
 	fpi = ((FLOAT)(3.1415265f));
@@ -319,6 +379,7 @@ static inline void make_sine(WAVEHDR& hdr)
 	{
 		fi = ((FLOAT)(i));
 		fx = ((ftwo * fpi * tone_freq) * fi) / sampling_rate;
+		if(fx > ftwo * fpi){ fx -= ftwo * fpi; }
 		fya = ((FLOAT)(pfn_sin(fx)));
 		fyb = fya * famp;
 		shrt = ((SHORT)(fyb));
@@ -351,22 +412,26 @@ static inline void sound(void)
 	HANDLE wo;
 	BOOL b;
 
+	#if bitness == 32
+	teb = ((PTEB)(__readfsdword(0x18))); mk_assert(teb);
+	#elif bitness == 64
 	teb = ((PTEB)(__readgsqword(0x30))); mk_assert(teb);
+	#endif
 	mk_assert(teb->NtTib.Self == &teb->NtTib);
 	peb = teb->ProcessEnvironmentBlock; mk_assert(peb);
 	kernel = find_module(peb, k_hash_kernel); mk_assert(kernel);
-	pfn_LoadLibraryA        = ((tfn_LoadLibraryA       )(find_proc(kernel, k_hash_LoadLibraryA       ))); mk_assert(pfn_LoadLibraryA       );
-	pfn_CreateEventA        = ((tfn_CreateEventA       )(find_proc(kernel, k_hash_CreateEventA       ))); mk_assert(pfn_CreateEventA       );
-	pfn_ResetEvent          = ((tfn_ResetEvent         )(find_proc(kernel, k_hash_ResetEvent         ))); mk_assert(pfn_ResetEvent         );
-	pfn_WaitForSingleObject = ((tfn_WaitForSingleObject)(find_proc(kernel, k_hash_WaitForSingleObject))); mk_assert(pfn_WaitForSingleObject);
+	pfn_LoadLibraryA        = ((tfn_LoadLibraryA       )(find_proc(peb, kernel, k_hash_LoadLibraryA       ))); mk_assert(pfn_LoadLibraryA       );
+	pfn_CreateEventA        = ((tfn_CreateEventA       )(find_proc(peb, kernel, k_hash_CreateEventA       ))); mk_assert(pfn_CreateEventA       );
+	pfn_ResetEvent          = ((tfn_ResetEvent         )(find_proc(peb, kernel, k_hash_ResetEvent         ))); mk_assert(pfn_ResetEvent         );
+	pfn_WaitForSingleObject = ((tfn_WaitForSingleObject)(find_proc(peb, kernel, k_hash_WaitForSingleObject))); mk_assert(pfn_WaitForSingleObject);
 	evt = pfn_CreateEventA(NULL, FALSE, FALSE, NULL); mk_assert(evt);
 	winmm = pfn_LoadLibraryA("winmm"); mk_assert(evt);
-	pfn_waveOutOpen            = ((tfn_waveOutOpen           )(find_proc(winmm, k_hash_waveOutOpen           ))); mk_assert(pfn_waveOutOpen           );
-	pfn_waveOutReset           = ((tfn_waveOutReset          )(find_proc(winmm, k_hash_waveOutReset          ))); mk_assert(pfn_waveOutReset          );
-	pfn_waveOutClose           = ((tfn_waveOutClose          )(find_proc(winmm, k_hash_waveOutClose          ))); mk_assert(pfn_waveOutClose          );
-	pfn_waveOutPrepareHeader   = ((tfn_waveOutPrepareHeader  )(find_proc(winmm, k_hash_waveOutPrepareHeader  ))); mk_assert(pfn_waveOutPrepareHeader  );
-	pfn_waveOutUnprepareHeader = ((tfn_waveOutUnprepareHeader)(find_proc(winmm, k_hash_waveOutUnprepareHeader))); mk_assert(pfn_waveOutUnprepareHeader);
-	pfn_waveOutWrite           = ((tfn_waveOutWrite          )(find_proc(winmm, k_hash_waveOutWrite          ))); mk_assert(pfn_waveOutWrite          );
+	pfn_waveOutOpen            = ((tfn_waveOutOpen           )(find_proc(peb, winmm, k_hash_waveOutOpen           ))); mk_assert(pfn_waveOutOpen           );
+	pfn_waveOutReset           = ((tfn_waveOutReset          )(find_proc(peb, winmm, k_hash_waveOutReset          ))); mk_assert(pfn_waveOutReset          );
+	pfn_waveOutClose           = ((tfn_waveOutClose          )(find_proc(peb, winmm, k_hash_waveOutClose          ))); mk_assert(pfn_waveOutClose          );
+	pfn_waveOutPrepareHeader   = ((tfn_waveOutPrepareHeader  )(find_proc(peb, winmm, k_hash_waveOutPrepareHeader  ))); mk_assert(pfn_waveOutPrepareHeader  );
+	pfn_waveOutUnprepareHeader = ((tfn_waveOutUnprepareHeader)(find_proc(peb, winmm, k_hash_waveOutUnprepareHeader))); mk_assert(pfn_waveOutUnprepareHeader);
+	pfn_waveOutWrite           = ((tfn_waveOutWrite          )(find_proc(peb, winmm, k_hash_waveOutWrite          ))); mk_assert(pfn_waveOutWrite          );
 	format.wFormatTag = 1;
 	format.nChannels = 1;
 	format.nSamplesPerSec = k_sampling_rate;
@@ -412,10 +477,10 @@ extern "C" DWORD __stdcall mk_entry(PPEB const peb)
 	INT res;
 
 	kernel = find_module(peb, k_hash_kernel); mk_assert(kernel);
-	pfn_ExitProcess  = ((tfn_ExitProcess )(find_proc(kernel, k_hash_ExitProcess ))); mk_assert(pfn_ExitProcess );
-	pfn_LoadLibraryA = ((tfn_LoadLibraryA)(find_proc(kernel, k_hash_LoadLibraryA))); mk_assert(pfn_LoadLibraryA);
+	pfn_ExitProcess  = ((tfn_ExitProcess )(find_proc(peb, kernel, k_hash_ExitProcess ))); mk_assert(pfn_ExitProcess );
+	pfn_LoadLibraryA = ((tfn_LoadLibraryA)(find_proc(peb, kernel, k_hash_LoadLibraryA))); mk_assert(pfn_LoadLibraryA);
 	user = pfn_LoadLibraryA("user32"); mk_assert(user);
-	pfn_MessageBoxA = ((tfn_MessageBoxA)(find_proc(user, k_hash_MessageBoxA))); mk_assert(pfn_MessageBoxA);
+	pfn_MessageBoxA = ((tfn_MessageBoxA)(find_proc(peb, user, k_hash_MessageBoxA))); mk_assert(pfn_MessageBoxA);
 	res = pfn_MessageBoxA(NULL, "Sample text.", "Sample Caption", MB_OK | MB_ICONINFORMATION); mk_assert(res == IDOK);
 	sound::sound();
 	pfn_ExitProcess(42);
